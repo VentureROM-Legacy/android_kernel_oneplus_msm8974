@@ -712,12 +712,11 @@ static void mdss_mdp_perf_calc_ctl(struct mdss_mdp_ctl *ctl,
 			right_plist, (right_plist ? MDSS_MDP_MAX_STAGE : 0));
 
 	if (ctl->is_video_mode) {
-		if (perf->bw_overlap > perf->bw_prefill)
-			perf->bw_ctl = apply_fudge_factor(perf->bw_ctl,
-				&mdss_res->ib_factor_overlap);
-		else
-			perf->bw_ctl = apply_fudge_factor(perf->bw_ctl,
-				&mdss_res->ib_factor);
+		perf->bw_ctl =
+			max(apply_fudge_factor(perf->bw_overlap,
+				&mdss_res->ib_factor_overlap),
+			apply_fudge_factor(perf->bw_prefill,
+				&mdss_res->ib_factor));
 	}
 	pr_debug("ctl=%d clk_rate=%u\n", ctl->num, perf->mdp_clk_rate);
 	pr_debug("bw_overlap=%llu bw_prefill=%llu prefill_bytes=%d\n",
@@ -1663,17 +1662,14 @@ static void mdss_mdp_ctl_split_display_enable(int enable,
 		if (main_ctl->opmode & MDSS_MDP_CTL_OP_CMD_MODE) {
 			upper |= BIT(1);
 			lower |= BIT(1);
-
-			/* interface controlling sw trigger */
-			if (main_ctl->intf_num == MDSS_MDP_INTF2)
-				upper |= BIT(4);
-			else
-				upper |= BIT(8);
-		} else { /* video mode */
-			if (main_ctl->intf_num == MDSS_MDP_INTF2)
-				lower |= BIT(4);
-			else
-				lower |= BIT(8);
+		}
+		/* interface controlling sw trigger (cmd & video mode)*/
+		if (main_ctl->intf_num == MDSS_MDP_INTF2) {
+			lower |= BIT(4);
+			upper |= BIT(4);
+		} else {
+			lower |= BIT(8);
+			upper |= BIT(8);
 		}
 	}
 	MDSS_MDP_REG_WRITE(MDSS_MDP_REG_SPLIT_DISPLAY_UPPER_PIPE_CTRL, upper);
@@ -1746,22 +1742,37 @@ static void mdss_mdp_ctl_restore_sub(struct mdss_mdp_ctl *ctl)
 
 /*
  * mdss_mdp_ctl_restore() - restore mdp ctl path
- * @ctl: mdp controller.
  *
  * This function is called whenever MDP comes out of a power collapse as
- * a result of a screen update when DSI ULPS mode is enabled. It restores
- * the MDP controller's software state to the hardware registers.
+ * a result of a screen update. It restores the MDP controller's software
+ * state to the hardware registers.
  */
-void mdss_mdp_ctl_restore(struct mdss_mdp_ctl *ctl)
+void mdss_mdp_ctl_restore(void)
 {
+	struct mdss_mdp_ctl *ctl = NULL;
 	struct mdss_mdp_ctl *sctl;
+	struct mdss_data_type *mdata = mdss_mdp_get_mdata();
+	u32 cnum;
 
-	sctl = mdss_mdp_get_split_ctl(ctl);
-	mdss_mdp_ctl_restore_sub(ctl);
-	if (sctl) {
-		mdss_mdp_ctl_restore_sub(sctl);
-		mdss_mdp_ctl_split_display_enable(1, ctl, sctl);
+	mdss_mdp_clk_ctrl(MDP_BLOCK_POWER_ON, false);
+	for (cnum = MDSS_MDP_CTL0; cnum < mdata->nctl; cnum++) {
+		ctl = mdata->ctl_off + cnum;
+		if (!ctl->power_on)
+			continue;
+
+		pr_debug("restoring ctl%d, intf_type=%d\n", cnum,
+			ctl->intf_type);
+		ctl->play_cnt = 0;
+		sctl = mdss_mdp_get_split_ctl(ctl);
+		mdss_mdp_ctl_restore_sub(ctl);
+		if (sctl) {
+			mdss_mdp_ctl_restore_sub(sctl);
+			mdss_mdp_ctl_split_display_enable(1, ctl, sctl);
+		}
+		if (ctl->restore_fnc)
+			ctl->restore_fnc(ctl);
 	}
+	mdss_mdp_clk_ctrl(MDP_BLOCK_POWER_OFF, false);
 }
 
 static int mdss_mdp_ctl_start_sub(struct mdss_mdp_ctl *ctl, bool handoff)
@@ -2026,19 +2037,17 @@ void mdss_mdp_set_roi(struct mdss_mdp_ctl *ctl,
 	r_roi.w = data->r_roi.w;
 	r_roi.h = data->r_roi.h;
 
-
 	/* Reset ROI when we have (1) invalid ROI (2) feature disabled */
 	if ((!l_roi.w && l_roi.h) || (l_roi.w && !l_roi.h) ||
 		(!r_roi.w && r_roi.h) || (r_roi.w && !r_roi.h) ||
 		(!l_roi.w && !l_roi.h && !r_roi.w && !r_roi.h) ||
 		!ctl->panel_data->panel_info.partial_update_enabled) {
 		l_roi = (struct mdss_rect)
-		{0, 0, ctl->mixer_left->width,
-			ctl->mixer_left->height};
+		{0, 0, ctl->mixer_left->width, ctl->mixer_left->height};
 
 		if (ctl->mixer_right) {
 			r_roi = (struct mdss_rect)
-			{0, 0, ctl->mixer_right->width,
+				{0, 0, ctl->mixer_right->width,
 				ctl->mixer_right->height};
 		}
 	}
@@ -2691,11 +2700,6 @@ int mdss_mdp_display_commit(struct mdss_mdp_ctl *ctl, void *arg,
 		ATRACE_END("mixer_programming");
 	}
 
-	ATRACE_BEGIN("frame_ready");
-	if (!ctl->shared_lock)
-		mdss_mdp_ctl_notify(ctl, MDP_NOTIFY_FRAME_READY);
-	ATRACE_END("frame_ready");
-
 	ctl->roi_bkup.w = ctl->roi.w;
 	ctl->roi_bkup.h = ctl->roi.h;
 
@@ -2715,15 +2719,6 @@ int mdss_mdp_display_commit(struct mdss_mdp_ctl *ctl, void *arg,
 
 	ATRACE_END("postproc_programming");
 
-	ATRACE_BEGIN("flush_kickoff");
-	mdss_mdp_ctl_write(ctl, MDSS_MDP_REG_CTL_FLUSH, ctl->flush_bits);
-	if (sctl) {
-		mdss_mdp_ctl_write(sctl, MDSS_MDP_REG_CTL_FLUSH,
-			sctl->flush_bits);
-	}
-	wmb();
-	ctl->flush_bits = 0;
-
 	mdss_mdp_xlog_mixer_reg(ctl);
 
 	if (ctl->panel_data &&
@@ -2737,12 +2732,16 @@ int mdss_mdp_display_commit(struct mdss_mdp_ctl *ctl, void *arg,
 			sctl->panel_data->panel_info.roi = sctl->roi;
 	}
 
-	if (ctl->wait_pingpong) {
-		if (commit_cb)
-			commit_cb->commit_cb_fnc(
-				MDP_COMMIT_STAGE_WAIT_FOR_PINGPONG,
-				commit_cb->data);
+	ATRACE_BEGIN("frame_ready");
+	mdss_mdp_ctl_notify(ctl, MDP_NOTIFY_FRAME_CFG_DONE);
+	if (commit_cb)
+		commit_cb->commit_cb_fnc(
+			MDP_COMMIT_STAGE_SETUP_DONE,
+			commit_cb->data);
+	mdss_mdp_ctl_notify(ctl, MDP_NOTIFY_FRAME_READY);
+	ATRACE_END("frame_ready");
 
+	if (ctl->wait_pingpong) {
 		ATRACE_BEGIN("wait_pingpong");
 		ctl->wait_pingpong(ctl, NULL);
 		ATRACE_END("wait_pingpong");
@@ -2752,11 +2751,20 @@ int mdss_mdp_display_commit(struct mdss_mdp_ctl *ctl, void *arg,
 			sctl->wait_pingpong(sctl, NULL);
 			ATRACE_END("wait_pingpong sctl");
 		}
-
-		if (commit_cb)
-			commit_cb->commit_cb_fnc(MDP_COMMIT_STAGE_PINGPONG_DONE,
-				commit_cb->data);
 	}
+	if (commit_cb)
+		commit_cb->commit_cb_fnc(MDP_COMMIT_STAGE_READY_FOR_KICKOFF,
+			commit_cb->data);
+
+	ATRACE_BEGIN("flush_kickoff");
+	mdss_mdp_ctl_write(ctl, MDSS_MDP_REG_CTL_FLUSH, ctl->flush_bits);
+	if (sctl && sctl->flush_bits) {
+		mdss_mdp_ctl_write(sctl, MDSS_MDP_REG_CTL_FLUSH,
+			sctl->flush_bits);
+		sctl->flush_bits = 0;
+	}
+	wmb();
+	ctl->flush_bits = 0;
 
 	if (sctl && !ctl->valid_roi && sctl->valid_roi) {
 		/*

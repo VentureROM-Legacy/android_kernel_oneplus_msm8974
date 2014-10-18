@@ -1244,6 +1244,8 @@ int mdss_dsi_cmdlist_rx(struct mdss_dsi_ctrl_pdata *ctrl,
 int mdss_dsi_cmdlist_commit(struct mdss_dsi_ctrl_pdata *ctrl, int from_mdp)
 {
 	struct dcs_cmd_req *req;
+	struct mdss_panel_info *pinfo;
+	struct mdss_rect *roi = NULL;
 	int ret = -EINVAL;
 	int rc = 0;
 
@@ -1272,6 +1274,7 @@ int mdss_dsi_cmdlist_commit(struct mdss_dsi_ctrl_pdata *ctrl, int from_mdp)
 	 * also, axi bus bandwidth need since dsi controller will
 	 * fetch dcs commands from axi bus
 	 */
+	mdss_bus_bandwidth_ctrl(1);
 	mdss_bus_scale_set_quota(MDSS_HW_DSI0, SZ_1M, SZ_1M);
 
 	pr_debug("%s:  from_mdp=%d pid=%d\n", __func__, from_mdp, current->pid);
@@ -1283,61 +1286,47 @@ int mdss_dsi_cmdlist_commit(struct mdss_dsi_ctrl_pdata *ctrl, int from_mdp)
 		mutex_unlock(&ctrl->cmd_mutex);
 		return rc;
 	}
+
+	if (req->flags & CMD_REQ_HS_MODE)
+		mdss_dsi_set_tx_power_mode(0, &ctrl->panel_data);
+
 	if (req->flags & CMD_REQ_RX)
 		ret = mdss_dsi_cmdlist_rx(ctrl, req);
 	else
 		ret = mdss_dsi_cmdlist_tx(ctrl, req);
+
+	if (req->flags & CMD_REQ_HS_MODE)
+		mdss_dsi_set_tx_power_mode(1, &ctrl->panel_data);
+
 	mdss_iommu_ctrl(0);
 	mdss_dsi_clk_ctrl(ctrl, DSI_ALL_CLKS, 0);
 	mdss_bus_scale_set_quota(MDSS_HW_DSI0, 0, 0);
+	mdss_bus_bandwidth_ctrl(0);
 need_lock:
 
 	MDSS_XLOG(ctrl->ndx, from_mdp, ctrl->mdp_busy, current->pid,
 							XLOG_FUNC_EXIT);
 
 	if (from_mdp) { /* from mdp kickoff */
-		/* acquire lock only has new frame update */
-		if (ctrl->roi.w != 0 || ctrl->roi.h != 0)
+		/*
+		 * when partial update enabled, the roi of pinfo
+		 * is updated before mdp kickoff. Either width or
+		 * height of roi is 0, then it is false kickoff so
+		 * no mdp_busy flag set needed.
+		 * when partial update disabled, mdp_busy flag
+		 * alway set.
+		 */
+		pinfo = &ctrl->panel_data.panel_info;
+		if (pinfo->partial_update_enabled)
+			roi = &pinfo->roi;
+
+		if (!roi || (roi->w != 0 || roi->h != 0))
 			mdss_dsi_cmd_mdp_start(ctrl);
 
 		mutex_unlock(&ctrl->cmd_mutex);
 	}
 
 	return ret;
-}
-
-void mdss_dsi_debug_check_te(struct mdss_panel_data *pdata)
-{
-	struct mdss_dsi_ctrl_pdata *ctrl_pdata = NULL;
-	u8 rc, te_count = 0;
-	u8 te_max = 250;
-
-	if (pdata == NULL) {
-		pr_err("%s: Invalid input data\n", __func__);
-		return;
-	}
-	ctrl_pdata = container_of(pdata, struct mdss_dsi_ctrl_pdata,
-				panel_data);
-
-	pr_info(" ============ start waiting for TE ============\n");
-	for (te_count = 0; te_count < te_max; te_count++) {
-		rc = gpio_get_value(ctrl_pdata->disp_te_gpio);
-		if (rc != 0) {
-			pr_info("%s: gpio_get_value(disp_te_gpio) = %d ",
-								__func__, rc);
-			pr_info("te_count = %d\n", te_count);
-			break;
-		}
-		/* usleep suspends the calling thread whereas udelay is a
-		 * busy wait. Here the value of te_gpio is checked in a loop of
-		 * max count = 250. If this loop has to iterate multiple
-		 * times before the te_gpio is 1, the calling thread will end
-		 * up in suspend/wakeup sequence multiple times if usleep is
-		 * used, which is an overhead. So use udelay instead of usleep.
-		 */
-		udelay(80);
-	}
-	pr_info(" ============ finish waiting for TE ============\n");
 }
 
 static void dsi_send_events(struct mdss_dsi_ctrl_pdata *ctrl, u32 events)

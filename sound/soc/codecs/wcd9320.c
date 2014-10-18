@@ -46,9 +46,13 @@ struct sound_control {
 	int default_speaker_value;
 	int default_mic_value;
 	struct snd_soc_codec *snd_control_codec;
-	bool lock;
+	bool playback_lock;
+	bool speaker_lock;
+	bool recording_lock;
 } soundcontrol = {
-	.lock = false,
+	.playback_lock = false,
+	.speaker_lock = false,
+	.recording_lock = false,
 };
 
 #define TAIKO_MAD_SLIMBUS_TX_PORT 12
@@ -616,6 +620,8 @@ static int taiko_enable_hpmic_switch(struct snd_soc_codec *codec, bool enable)
 				pr_err("%s: Failed to enable hpmic switch %d\n",
 						__func__, ret);
 			}
+			if (taiko->mbhc.mbhc_cfg->reset_gnd_mic)
+				taiko->mbhc.mbhc_cfg->reset_gnd_mic(codec->card);
 		}
 	} else {
 		if (atomic_read(&taiko->hpmic_ref) == 0)
@@ -1283,11 +1289,14 @@ static int taiko_mad_input_put(struct snd_kcontrol *kcontrol,
 	struct snd_ctl_elem_value *ucontrol)
 {
 	u8 taiko_mad_input;
+	u16 micb_int_reg, micb_4_int_reg;
 	struct snd_soc_codec *codec = snd_kcontrol_chip(kcontrol);
 	struct snd_soc_card *card = codec->card;
+	struct taiko_priv *taiko = snd_soc_codec_get_drvdata(codec);
 	char mad_amic_input_widget[6];
 	u32 adc;
 	const char *mad_input_widget;
+	const char *source_widget = NULL;
 	u32  mic_bias_found = 0;
 	u32 i;
 	int ret = 0;
@@ -1295,6 +1304,7 @@ static int taiko_mad_input_put(struct snd_kcontrol *kcontrol,
 
 	taiko_mad_input = ucontrol->value.integer.value[0];
 
+	micb_4_int_reg = taiko->resmgr.reg_addr->micb_4_int_rbias;
 	pr_debug("%s: taiko_mad_input = %s\n", __func__,
 			taiko_conn_mad_text[taiko_mad_input]);
 
@@ -1340,20 +1350,32 @@ static int taiko_mad_input_put(struct snd_kcontrol *kcontrol,
 		if (!strncmp(card->dapm_routes[i].sink,
 				mad_input_widget, strlen(mad_input_widget))) {
 
-			if (strnstr(card->dapm_routes[i].source,
+			source_widget = card->dapm_routes[i].source;
+			if (!source_widget) {
+				dev_err(codec->dev,
+					"%s: invalid source widget\n",
+					__func__);
+				return -EINVAL;
+			}
+
+			if (strnstr(source_widget,
 				"MIC BIAS1", sizeof("MIC BIAS1"))) {
 				mic_bias_found = 1;
+				micb_int_reg = TAIKO_A_MICB_1_INT_RBIAS;
 				break;
-			} else if (strnstr(card->dapm_routes[i].source,
+			} else if (strnstr(source_widget,
 				"MIC BIAS2", sizeof("MIC BIAS2"))) {
 				mic_bias_found = 2;
+				micb_int_reg = TAIKO_A_MICB_2_INT_RBIAS;
 				break;
-			} else if (strnstr(card->dapm_routes[i].source,
+			} else if (strnstr(source_widget,
 				"MIC BIAS3", sizeof("MIC BIAS3"))) {
 				mic_bias_found = 3;
+				micb_int_reg = TAIKO_A_MICB_3_INT_RBIAS;
 				break;
-			} else if (strnstr(card->dapm_routes[i].source,
+			} else if (strnstr(source_widget,
 				"MIC BIAS4", sizeof("MIC BIAS4"))) {
+				micb_int_reg = micb_4_int_reg;
 				mic_bias_found = 4;
 				break;
 			}
@@ -1369,6 +1391,29 @@ static int taiko_mad_input_put(struct snd_kcontrol *kcontrol,
 					0x0F, taiko_mad_input);
 		snd_soc_update_bits(codec, TAIKO_A_MAD_ANA_CTRL,
 					0x07, mic_bias_found);
+
+		/* Setup internal micbias */
+		if (strnstr(source_widget, "Internal1",
+			    strlen(source_widget)))
+			snd_soc_update_bits(codec,
+					    micb_int_reg,
+					    0xE0, 0xE0);
+		else if (strnstr(source_widget, "Internal2",
+				 strlen(source_widget)))
+			snd_soc_update_bits(codec,
+					    micb_int_reg,
+					    0x1C, 0x1C);
+		else if (strnstr(source_widget, "Internal3",
+				 strlen(source_widget)))
+			snd_soc_update_bits(codec,
+					    micb_int_reg,
+					    0x3, 0x3);
+		else
+			/*
+			 *  If not internal, make sure to write the
+			 *  register to default value
+			 */
+			snd_soc_write(codec, micb_int_reg, 0x24);
 		return 0;
 	} else {
 		pr_err("%s: mic bias source not found for input = %s\n",
@@ -3072,6 +3117,12 @@ static int taiko_codec_enable_micbias(struct snd_soc_dapm_widget *w,
 			snd_soc_update_bits(codec, micb_int_reg, 0x1C, 0x1C);
 		else if (strnstr(w->name, internal3_text, 30))
 			snd_soc_update_bits(codec, micb_int_reg, 0x3, 0x3);
+		else
+			/*
+			 *  If not internal, make sure to write the
+			 *  register to default value
+			 */
+			snd_soc_write(codec, micb_int_reg, 0x24);
 
 		if (taiko->mbhc_started && micb_ctl_reg == TAIKO_A_MICB_2_CTL) {
 			if (++taiko->micb_2_users == 1) {
@@ -4634,33 +4685,22 @@ static int taiko_volatile(struct snd_soc_codec *ssc, unsigned int reg)
 	return 0;
 }
 
-int reg_access(unsigned int reg)
+static int reg_access(unsigned int reg)
 {
 	int ret = 1;
 
 	switch (reg) {
-		case TAIKO_A_RX_HPH_L_GAIN:
-		case TAIKO_A_RX_HPH_R_GAIN:
-		case TAIKO_A_RX_HPH_L_STATUS:
-		case TAIKO_A_RX_HPH_R_STATUS:
 		case TAIKO_A_CDC_RX1_VOL_CTL_B2_CTL:
 		case TAIKO_A_CDC_RX2_VOL_CTL_B2_CTL:
+			if (soundcontrol.playback_lock)
+                                ret = 0;
+                        break;
 		case TAIKO_A_CDC_RX3_VOL_CTL_B2_CTL:
-		case TAIKO_A_CDC_RX4_VOL_CTL_B2_CTL:
-		case TAIKO_A_CDC_RX5_VOL_CTL_B2_CTL:
-		case TAIKO_A_CDC_RX6_VOL_CTL_B2_CTL:
-		case TAIKO_A_CDC_RX7_VOL_CTL_B2_CTL:
-		case TAIKO_A_CDC_TX1_VOL_CTL_GAIN:
-		case TAIKO_A_CDC_TX2_VOL_CTL_GAIN:
+			if (soundcontrol.speaker_lock)
+                                ret = 0;
+			break;
 		case TAIKO_A_CDC_TX3_VOL_CTL_GAIN:
-		case TAIKO_A_CDC_TX4_VOL_CTL_GAIN:
-		case TAIKO_A_CDC_TX5_VOL_CTL_GAIN:
-		case TAIKO_A_CDC_TX6_VOL_CTL_GAIN:
-		case TAIKO_A_CDC_TX7_VOL_CTL_GAIN:
-		case TAIKO_A_CDC_TX8_VOL_CTL_GAIN:
-		case TAIKO_A_CDC_TX9_VOL_CTL_GAIN:
-		case TAIKO_A_CDC_TX10_VOL_CTL_GAIN:
-			if (soundcontrol.lock)
+			if (soundcontrol.recording_lock)
 				ret = 0;
 			break;
 		default:
@@ -6332,6 +6372,22 @@ static irqreturn_t taiko_slimbus_irq(int irq, void *data)
 		port_id = (tx ? j - 16 : j);
 		val = wcd9xxx_interface_reg_read(codec->control_data,
 					TAIKO_SLIM_PGD_PORT_INT_RX_SOURCE0 + j);
+		if (val) {
+			if (!tx)
+				reg = TAIKO_SLIM_PGD_PORT_INT_EN0 +
+					(port_id / 8);
+			else
+				reg = TAIKO_SLIM_PGD_PORT_INT_TX_EN0 +
+					(port_id / 8);
+			int_val = wcd9xxx_interface_reg_read(
+				codec->control_data, reg);
+			/*
+			 * Ignore interrupts for ports for which the
+			 * interrupts are not specifically enabled.
+			 */
+			if (!(int_val & (1 << (port_id % 8))))
+				continue;
+		}
 		if (val & TAIKO_SLIM_IRQ_OVERFLOW)
 			pr_err_ratelimited(
 			   "%s: overflow error on %s port %d, value %x\n",
@@ -7402,71 +7458,61 @@ static struct regulator *taiko_codec_find_regulator(struct snd_soc_codec *codec,
 	return NULL;
 }
 
-void update_headphones_volume_boost(int vol_boost)
+void update_headphones_volume_boost(unsigned int vol_boost)
 {
 	int default_val = soundcontrol.default_headphones_value;
-	int boosted_val = vol_boost != 0 ? 
-		default_val + vol_boost : default_val;
+	int boosted_val = default_val + vol_boost;
 
 	pr_info("Sound Control: Headphones default value %d\n", default_val);
 
-	soundcontrol.lock = false;
+	soundcontrol.playback_lock = false;
 	taiko_write(soundcontrol.snd_control_codec,
 		TAIKO_A_CDC_RX1_VOL_CTL_B2_CTL, boosted_val);
 	taiko_write(soundcontrol.snd_control_codec,
 		TAIKO_A_CDC_RX2_VOL_CTL_B2_CTL, boosted_val);
-	soundcontrol.lock = true;
+	soundcontrol.playback_lock = true;
 
 	pr_info("Sound Control: Boosted Headphones RX1 value %d\n",
 		taiko_read(soundcontrol.snd_control_codec,
 		TAIKO_A_CDC_RX1_VOL_CTL_B2_CTL));
 
-	pr_info("Sound Control: Boosted Headphones RX2 value %d\n", 
-		taiko_read(soundcontrol.snd_control_codec, 
+	pr_info("Sound Control: Boosted Headphones RX2 value %d\n",
+		taiko_read(soundcontrol.snd_control_codec,
 		TAIKO_A_CDC_RX2_VOL_CTL_B2_CTL));
 }
 
 void update_speaker_gain(int vol_boost)
 {
 	int default_val = soundcontrol.default_speaker_value;
-	int boosted_val = vol_boost != 0 ? 
-		default_val + vol_boost : default_val;
+	int boosted_val = default_val + vol_boost;
 
 	pr_info("Sound Control: Speaker default value %d\n", default_val);
 
-	soundcontrol.lock = false;
+	soundcontrol.speaker_lock = false;
 	taiko_write(soundcontrol.snd_control_codec,
 		TAIKO_A_CDC_RX3_VOL_CTL_B2_CTL, boosted_val);
-
-	taiko_write(soundcontrol.snd_control_codec,
-		TAIKO_A_CDC_RX7_VOL_CTL_B2_CTL, boosted_val);
-	soundcontrol.lock = true;
+	soundcontrol.speaker_lock = true;
 
 	pr_info("Sound Control: Boosted Speaker RX3 value %d\n",
 		taiko_read(soundcontrol.snd_control_codec,
 		TAIKO_A_CDC_RX3_VOL_CTL_B2_CTL));
-
-	pr_info("Sound Control: Boosted Speaker RX7 value %d\n",
-		taiko_read(soundcontrol.snd_control_codec,
-		TAIKO_A_CDC_RX7_VOL_CTL_B2_CTL));
 }
 
-void update_mic_gain(int vol_boost)
+void update_mic_gain(unsigned int vol_boost)
 {
 	int default_val = soundcontrol.default_mic_value;
-	int boosted_val = vol_boost != 0 ? 
-		default_val + vol_boost : default_val;
+	int boosted_val = default_val + vol_boost;
 
 	pr_info("Sound Control: Mic default value %d\n", default_val);
 
-	soundcontrol.lock = false;
+	soundcontrol.recording_lock = false;
 	taiko_write(soundcontrol.snd_control_codec,
-		TAIKO_A_CDC_TX7_VOL_CTL_GAIN, boosted_val);
-	soundcontrol.lock = true;
+		TAIKO_A_CDC_TX3_VOL_CTL_GAIN, boosted_val);
+	soundcontrol.recording_lock = true;
 
 	pr_info("Sound Control: Boosted Mic value %d\n",
 		taiko_read(soundcontrol.snd_control_codec,
-		TAIKO_A_CDC_TX7_VOL_CTL_GAIN));
+		TAIKO_A_CDC_TX3_VOL_CTL_GAIN));
 }
 
 static int taiko_codec_probe(struct snd_soc_codec *codec)
@@ -7660,12 +7706,12 @@ static int taiko_codec_probe(struct snd_soc_codec *codec)
 	/*
 	 * Get the default values during probe
 	 */
-	soundcontrol.default_headphones_value = taiko_read(codec, 
+	soundcontrol.default_headphones_value = taiko_read(codec,
 		TAIKO_A_CDC_RX1_VOL_CTL_B2_CTL);
 	soundcontrol.default_speaker_value = taiko_read(codec,
 		TAIKO_A_CDC_RX3_VOL_CTL_B2_CTL);
 	soundcontrol.default_mic_value = taiko_read(codec,
-		TAIKO_A_CDC_TX7_VOL_CTL_GAIN);
+		TAIKO_A_CDC_TX3_VOL_CTL_GAIN);
 
 	return ret;
 

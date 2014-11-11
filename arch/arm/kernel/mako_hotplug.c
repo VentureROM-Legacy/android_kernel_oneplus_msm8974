@@ -48,6 +48,7 @@ struct cpu_stats {
 	struct notifier_block notif;
 	u64 timestamp;
 	uint32_t freq;
+	uint32_t saved_freq;
 	bool screen_cap_lock;
 	bool suspend;
 } stats = {
@@ -260,37 +261,52 @@ static struct notifier_block cpufreq_notifier = {
 	.notifier_call = cpufreq_callback,
 };
 
-static void screen_off_cap(bool nerf)
+static void screen_off_max_freq(int cpu, bool lower_max_freq)
 {
-	int cpu;
+	stats.freq = lower_max_freq ? MAX_FREQ_CAP : stats.saved_freq;
 
-	stats.freq = nerf ? MAX_FREQ_CAP : LONG_MAX;
+	/*
+	 * This can be 0 on bootup if policy->max is not yet set
+	 */
+	if (!stats.freq)
+		stats.freq = LONG_MAX;
 
+	/*
+	 * Simple lock not for concurrent accesses, but to prevent
+	 * the notifier to trigger a policy limits verify unless we
+	 * requested it
+	 */
 	stats.screen_cap_lock = true;
-
-	for_each_online_cpu(cpu)
-		cpufreq_update_policy(cpu);
-
+	cpufreq_update_policy(cpu);
 	stats.screen_cap_lock = false;
 }
 
 static void mako_hotplug_suspend(struct work_struct *work)
 {
+	struct cpufreq_policy *policy = cpufreq_cpu_get(0);
 	int cpu;
 
-	stats.counter = 0;
+	/*
+	 * Save the current max freq before capping it to 1GHz
+	 * so that we can restore it after screen on.
+	 * TODO: More tests for thermal throttle cases
+	 */
+	if (!policy)
+		stats.saved_freq = LONG_MAX;
+	else
+		stats.saved_freq = policy->max;
 
 	for_each_online_cpu(cpu) {
-		if (cpu < 2)
+		if (cpu < 2) {
+			screen_off_max_freq(cpu, true);
 			continue;
+		}
 
 		cpu_down(cpu);
 	}
 
-
+	stats.counter = 0;
 	stats.suspend = true;
-
-	screen_off_cap(true);
 
 	pr_info("%s: suspend\n", MAKO_HOTPLUG);
 }
@@ -299,11 +315,11 @@ static void __ref mako_hotplug_resume(struct work_struct *work)
 {
 	int cpu;
 
-	screen_off_cap(false);
-
 	for_each_possible_cpu(cpu) {
-		if (!cpu || cpu_online(cpu))
+		if (cpu_online(cpu)) {
+			screen_off_max_freq(cpu, false);
 			continue;
+		}
 
 		cpu_up(cpu);
 	}
